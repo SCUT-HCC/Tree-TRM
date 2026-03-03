@@ -1,0 +1,46 @@
+# Video-Tree-TRM RAG 依赖列表
+# 安装方法：pip install -r video_tree_trmRAG/requirements_video.txt
+#
+# 注意事项：
+#   1. CLIP 需要通过 git 方式安装（官方未发布至 PyPI）
+#   2. 若使用 Ollama 后端，需额外部署 ollama 服务（见 USAGE_GUIDE.md）
+#   3. CUDA 环境：torch 和 torchvision 版本请匹配本地 CUDA 版本
+#      参考：https://pytorch.org/get-started/locally/
+
+# ── 核心深度学习框架 ─────────────────────────────────────────────────────
+torch>=1.13.0
+torchvision>=0.14.0
+
+# ── CLIP（OpenAI 官方实现，需从 GitHub 安装）────────────────────────────
+# pip install git+https://github.com/openai/CLIP.git
+# 注：若 git 受限，可使用镜像：
+# pip install git+https://gitee.com/mirrors/CLIP.git
+git+https://github.com/openai/CLIP.git
+
+# ── 视频处理 ─────────────────────────────────────────────────────────────
+opencv-python>=4.6.0.66          # 视频读取与帧提取
+Pillow>=9.0.0                     # 图像处理（PIL）
+
+# ── 数值计算 ─────────────────────────────────────────────────────────────
+numpy>=1.21.0
+
+# ── HTTP 客户端（VLM API 调用） ──────────────────────────────────────────
+requests>=2.28.0
+
+# ── 配置文件解析 ─────────────────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── 进度条 ───────────────────────────────────────────────────────────────
+tqdm>=4.64.0
+
+# ── 可选：更快的 JSON 解析（大金字塔加载提速）────────────────────────────
+# ujson>=5.0.0
+
+# ── 可选：分布式嵌入计算（多 GPU 加速）──────────────────────────────────
+# accelerate>=0.20.0
+
+# ── 开发 & 调试（可选）──────────────────────────────────────────────────
+# ipython>=8.0.0
+# matplotlib>=3.5.0     # 可视化分数分布
+# seaborn>=0.12.0       # 热力图可视化
+
