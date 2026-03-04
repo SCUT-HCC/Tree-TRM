@@ -72,6 +72,49 @@ class PyramidConfig:
     max_frame_long_side: int = 336
     """CLIP 输入前的图像最大长边（像素），超过则按比例缩放。"""
 
+    # ── 智能场景切分（Qwen-VL Scene Detection） ───────────────────────
+    use_qwen_scene_detection: bool = False
+    """是否使用 Qwen-VL 进行智能场景边界检测，替代固定时长的 L1 切分。
+    启用后，将以 scene_detection_probe_fps 的帧率采样探测帧，批量发送给
+    Qwen-VL 识别场景转换点，使 L1 分段边界与内容语义对齐。
+    需同时在 VLMConfig 中设置 qwen_api_key。
+    """
+
+    scene_detection_probe_fps: float = 0.5
+    """场景检测时的探测帧率（fps）。默认 0.5 = 每 2 秒采一帧。
+    值越小，API 调用次数越少；值越大，边界定位越精确。
+    """
+
+    scene_detection_batch_size: int = 8
+    """每次发送给 Qwen-VL 进行场景检测的帧数（相邻批次重叠 1 帧）。
+    增大可减少 API 调用次数，但每次请求的图像数量增加。
+    """
+
+    l1_min_duration: float = 60.0
+    """场景感知切分中 L1 段的最小时长（秒），防止场景切分过于碎片化。
+    过短的相邻段会自动合并，直至满足最小时长要求。
+    """
+
+    l1_max_duration: float = 1200.0
+    """场景感知切分中 L1 段的最大时长（秒），防止单段过长。
+    超长段会被自动均匀拆分为多个子段。
+    """
+
+    # ── 关键帧筛选（Qwen-VL Keyframe Scoring） ────────────────────────
+    use_qwen_keyframe_scoring: bool = False
+    """是否使用 Qwen-VL 对 L3 候选帧打分，仅保留 Top-K 关键帧。
+    启用后，对每个 L2 clip 内均匀采样得到的候选帧池，调用 Qwen-VL
+    按动作重要性与视觉信息密度排序，仅保留最重要的 top-k 帧作为 L3 节点。
+    可显著降低 L3 噪声帧比例，提升 Phase-3 检索准确率 +10-15%。
+    需同时在 VLMConfig 中设置 qwen_api_key。
+    """
+
+    qwen_keyframe_keep_ratio: float = 0.5
+    """L3 帧筛选保留比例（0.0 ~ 1.0）。
+    例如 0.5 = 保留每个 clip 内 50% 最重要的帧；
+    最终保留帧数 = round(候选帧数 × keep_ratio)，且不少于 1 帧。
+    """
+
 
 # ---------------------------------------------------------------------------
 # Level 2  Embedding

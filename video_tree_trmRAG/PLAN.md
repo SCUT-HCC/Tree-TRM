@@ -152,12 +152,12 @@ Video-Tree-TRM RAG 系统架构
 |------|--------|---------|
 | `config.py` | `VideoTreeTRMConfig` 等 5 个 dataclass | 统一配置管理，支持字典/YAML 加载 |
 | `video_pyramid.py` | `HierarchicalSemanticPyramid`, `SegmentNode`, `ClipNode`, `FrameNode` | HSP 三层数据结构，序列化/反序列化 |
-| `video_indexer.py` | `VideoFrameExtractor`, `VLMDescriptionGenerator`, `CLIPFeatureExtractor`, `OllamaTextEmbedder` | 视频原始素材处理与特征提取 |
+| `video_indexer.py` | `VideoFrameExtractor`, `VLMDescriptionGenerator`, `CLIPFeatureExtractor`, `OllamaTextEmbedder`, `QwenSceneDetector`★, `QwenKeyframeScorer`★, `segment_video`, `segment_video_smart`★ | 视频原始素材处理、特征提取；★= v1.1 新增 |
 | `visual_projection.py` | `VisualProjectionLayer`, `ProjectionManager` | 视觉特征 → 文本潜空间对齐投影 |
 | `video_tree_trm.py` | `VideoTreeTRM`, `RetrievalTrace` | 三阶段递归检索核心引擎 |
 | `answer_generator.py` | `AnswerGenerator` | 基于关键帧的 VLM 答案生成 |
-| `pipeline.py` | `VideoQAPipeline`, `VideoQAResult` | 端到端统一推理管线 |
-| `build_pyramid.py` | `main()` | 离线金字塔构建 CLI 工具 |
+| `pipeline.py` | `VideoQAPipeline`, `VideoQAResult` | 端到端统一推理管线；v1.1 新增 Qwen 两条增强分支 |
+| `build_pyramid.py` | `main()` | 离线金字塔构建 CLI 工具；v1.1 新增 7 个 Qwen 参数 |
 | `run_videoqa.py` | `main()` | 在线视频问答 CLI 工具 |
 
 ### 5.2 模块依赖关系
@@ -294,12 +294,20 @@ class RetrievalTrace:
 输入：原始视频文件 video.mp4
 
 步骤 1：获取视频基础信息
-  - 使用 cv2.VideoCapture 读取总帧数和帧率
+  - 使用 cv2.VideoCapture 读取总帧数和帧率（PyAV 兜底）
   - 计算视频总时长 duration
 
-步骤 2：时间分段
-  - L1 分段：每 600s（10min）一个宏观事件段，最多 50 段
-  - L2 分段：每段内每 20s 一个短片段，最多 60 个/段
+步骤 2：时间分段（两种模式，任选其一）
+  ┌─ 模式 A（默认）：固定步长切分
+  │   - L1 分段：每 600s（10min）一个宏观事件段，最多 50 段
+  │   - L2 分段：每段内每 20s 一个短片段，最多 60 个/段
+  │
+  └─ 模式 B（★v1.1，use_qwen_scene_detection=True）：Qwen-VL 场景感知切分
+      a. 以 scene_detection_probe_fps（默认 0.5fps）采样全局探测帧
+      b. QwenSceneDetector 以滑动窗口批量调用 Qwen-VL，返回场景边界时间戳
+      c. segment_video_smart：合并过短段（< l1_min_duration）、
+         拆分过长段（> l1_max_duration），生成语义对齐的 L1 分段
+      d. L2 仍采用固定步长
 
 步骤 3：L1 节点构建（循环每个 L1 段）
   a. 以低帧率（0.1fps）提取代表帧，保存为 JPEG
@@ -314,15 +322,21 @@ class RetrievalTrace:
   d. 创建 ClipNode
 
 步骤 5：L3 节点构建（同时进行）
-  a. 以 1fps 提取高密度关键帧
-  b. 批量送入 CLIP 图像编码器，得到视觉嵌入 [N3, 512]
-  c. 通过 VisualProjectionLayer 投影到文本潜空间
-  d. 创建 FrameNode（含帧路径和视觉嵌入）
+  a. 以 1fps 提取高密度候选帧
+  ┌─ 步骤 5b（★v1.1，use_qwen_keyframe_scoring=True）：Qwen-VL 关键帧筛选
+  │   - 加载 clip 内所有候选帧图像
+  │   - QwenKeyframeScorer 一次调用 Qwen-VL，返回 Top-K 帧索引（重要性排序）
+  │   - 按时序重排，保留 Top-K 帧替代全部候选帧
+  └─ 步骤 5b（默认）：截断到 l3_max_frames_per_clip
+  c. 批量送入 CLIP 图像编码器，得到视觉嵌入 [N3, 512]
+  d. 通过 VisualProjectionLayer 投影到文本潜空间
+  e. 创建 FrameNode（含帧路径和视觉嵌入）
 
 步骤 6：保存金字塔
   - 序列化所有嵌入矩阵为 .npy 文件
   - 序列化文本元数据为 JSON 文件
   - 写入 metadata.json 记录配置和统计信息
+  - 写入 build_summary.json 记录构建耗时和节点统计
 ```
 
 ### 8.2 在线推理流程（每次查询）
@@ -400,9 +414,18 @@ video_tree_trmRAG/
 
 - [x] **帧提取器**（`VideoFrameExtractor`）：基于 OpenCV，支持时间区间、帧率配置、断点续传
 - [x] **时间分段函数**（`segment_video`）：两级时间切分，支持最大节点数限制
-- [x] **VLM 描述生成器**（`VLMDescriptionGenerator`）：Ollama/OpenAI/Stub 三后端，指数退避重试
+- [x] **VLM 描述生成器**（`VLMDescriptionGenerator`）：Ollama/OpenAI/Qwen/Stub 四后端，指数退避重试
 - [x] **CLIP 特征提取器**（`CLIPFeatureExtractor`）：批量图像和文本编码，延迟加载模型
 - [x] **Ollama 文本嵌入器**（`OllamaTextEmbedder`）：调用 nomic-embed-text API
+
+### Phase 1.1：Qwen-VL 智能增强（已完成，v1.1）
+
+- [x] **Qwen-VL 场景检测器**（`QwenSceneDetector`）：滑动窗口批量调用 Qwen-VL，检测场景边界时间戳
+- [x] **语义感知切分函数**（`segment_video_smart`）：基于边界时间戳的动态 L1 分段（含合并/拆分逻辑）
+- [x] **Qwen-VL 关键帧打分器**（`QwenKeyframeScorer`）：对 L3 候选帧评分，保留 Top-K 高信息密度帧
+- [x] **Config 字段扩展**（`PyramidConfig`）：新增 7 个 Qwen 增强相关配置字段
+- [x] **Pipeline 集成**（`VideoQAPipeline.build_pyramid`）：Qwen 组件按开关字段惰性初始化，向后兼容
+- [x] **CLI 参数扩展**（`build_pyramid.py`）：新增 7 个 `--use_qwen_*` 系列参数
 
 ### Phase 2：嵌入对齐（已完成）
 
@@ -431,10 +454,12 @@ video_tree_trmRAG/
 ### 后续拓展方向（规划中）
 
 - [ ] **训练投影层**：收集视频-文本对齐数据，端到端微调 `VisualProjectionLayer`
-- [ ] **Top-K 多路径检索**：在每个阶段保留 Top-K 候选，最终 rerank
+- [ ] **Top-K 多路径检索**：在每个阶段保留 Top-K 候选，最终 rerank（`QwenKeyframeScorer` 已提供 reranking 雏形）
 - [ ] **音频模态融合**：提取语音转文字（ASR），增强 L2 节点语义
 - [ ] **字幕/OCR 融合**：视频字幕作为辅助 L2 描述来源
-- [ ] **EvalKit**：基于 EgoSchema/ActivityNet-QA 等 VideoQA 基准的自动评测脚本
+- [ ] **Qwen-VL Reranking**：利用 `QwenKeyframeScorer` 对 Phase 3 Top-3 候选帧做二次精排
+- [ ] **并行 VLM 调用**：使用 `ThreadPoolExecutor` 并行化 L1/L2 的 VLM 描述生成
+- [ ] **EvalKit**：基于 EgoSchema/ActivityNet-QA/Video-MME 等 VideoQA 基准的自动评测脚本
 
 ---
 
@@ -484,13 +509,17 @@ $$T_{inference} = O(N_1 + N_2^{(k1^*)} + N_3^{(k1^*,k2^*)}) \cdot t_{dot} + t_{V
 ### 12.2 拓展路线图
 
 ```
-V1.0（当前）：基础三层视觉 RAG
+V1.0：基础三层视觉 RAG（固定步长切分 + 均匀帧采样）
     ↓
-V1.1：引入 Top-K 多路径检索 + 最终 rerank
+V1.1（当前）：Qwen-VL 双重增强
+             ├─ 场景感知 L1 切分（QwenSceneDetector + segment_video_smart）
+             └─ L3 关键帧精选（QwenKeyframeScorer，预期 +10-15% 准确率）
     ↓
-V1.2：训练 VisualProjectionLayer（对比学习）
+V1.2：引入 Top-K 多路径检索 + Qwen-VL 最终 Rerank
     ↓
-V1.3：融合 ASR 字幕，L2 节点同时包含视觉描述和语音转录
+V1.3：训练 VisualProjectionLayer（对比学习）
+    ↓
+V1.4：融合 ASR 字幕，L2 节点同时包含视觉描述和语音转录
     ↓
 V2.0：可微分软选择（Soft Selection），支持端到端梯度反传
     ↓
@@ -501,5 +530,5 @@ V3.0：多视频跨文件检索（多视频金字塔合并）
 
 ---
 
-*文档版本：v1.0.0 | 最后更新：2026-02-25*
+*文档版本：v1.1.0 | 最后更新：2026-03-04 | 新增：Phase 1.1 Qwen-VL 智能增强模块、更新架构路线图*
 

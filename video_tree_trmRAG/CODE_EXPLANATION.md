@@ -10,6 +10,12 @@
 2. [config.py：配置系统设计](#2-configpy-配置系统设计)
 3. [video_pyramid.py：分层语义金字塔数据结构](#3-video_pyramidpy-分层语义金字塔数据结构)
 4. [video_indexer.py：视频原始素材处理](#4-video_indexerpy-视频原始素材处理)
+   - 4.1 `VideoFrameExtractor`：帧提取设计
+   - 4.2 `segment_video` / `segment_video_smart`：两级时间分段
+   - 4.3 `QwenSceneDetector`：Qwen-VL 智能场景检测
+   - 4.4 `QwenKeyframeScorer`：Qwen-VL 关键帧打分筛选
+   - 4.5 `VLMDescriptionGenerator`：VLM 描述生成
+   - 4.6 `sample_representative_frames`：均匀代表帧采样
 5. [visual_projection.py：跨模态特征对齐](#5-visual_projectionpy-跨模态特征对齐)
 6. [video_tree_trm.py：三阶段递归检索引擎（核心）](#6-video_tree_trmpy-三阶段递归检索引擎核心)
 7. [answer_generator.py：答案生成模块](#7-answer_generatorpy-答案生成模块)
@@ -52,13 +58,22 @@
   │
   ▼
 VideoFrameExtractor（video_indexer.py）
-  │ 帧提取（JPEG）+ 时间分段
+  │ 帧提取（JPEG）
+  ▼
+QwenSceneDetector [可选]（video_indexer.py）    ← v1.1 新增
+  │ 探测帧 → Qwen-VL → 场景边界时间戳
+  ▼
+segment_video_smart / segment_video（video_indexer.py）
+  │ L1/L2 时间分段（语义感知 或 固定步长）
   ▼
 VLMDescriptionGenerator（video_indexer.py）
   │ L1摘要 + L2描述（VLM生成文字）
   ▼
 CLIPFeatureExtractor / OllamaTextEmbedder（video_indexer.py）
-  │ L1/L2文本嵌入 + L3视觉嵌入
+  │ L1/L2文本嵌入 + L3视觉嵌入（原始候选帧）
+  ▼
+QwenKeyframeScorer [可选]（video_indexer.py）   ← v1.1 新增
+  │ 对 L3 候选帧打分 → 保留 Top-K 关键帧
   ▼
 VisualProjectionLayer（visual_projection.py）
   │ 视觉特征 → 文本潜空间（Proj 算子）
@@ -92,7 +107,30 @@ VideoTreeTRMConfig          # 根配置
   └── RetrievalConfig       # 检索引擎参数
 ```
 
-### 2.2 关键设计点
+### 2.2 `PyramidConfig` 新增 Qwen 增强字段（v1.1）
+
+为支持 Qwen-VL 智能场景切分与关键帧筛选，`PyramidConfig` 新增以下字段分为两组：
+
+**场景检测组（L1 语义切分）**：
+
+| 字段 | 类型 | 默认 | 作用 |
+|---|---|---|---|
+| `use_qwen_scene_detection` | bool | False | 开关：启用 Qwen-VL 替代固定步长切分 |
+| `scene_detection_probe_fps` | float | 0.5 | 探测帧率（帧/秒）；越高边界越精确，API 调用越多 |
+| `scene_detection_batch_size` | int | 8 | 每批发送帧数（相邻批次重叠 1 帧） |
+| `l1_min_duration` | float | 60.0 | 合并过短段的阈值（秒） |
+| `l1_max_duration` | float | 1200.0 | 拆分过长段的阈值（秒） |
+
+**关键帧筛选组（L3 信息密度优化）**：
+
+| 字段 | 类型 | 默认 | 作用 |
+|---|---|---|---|
+| `use_qwen_keyframe_scoring` | bool | False | 开关：启用 Qwen-VL 对 L3 帧打分筛选 |
+| `qwen_keyframe_keep_ratio` | float | 0.5 | 每 clip 内保留帧比例（0.0~1.0） |
+
+两组字段均在 `VLMConfig.qwen_api_key` 为空时自动降级，不影响原有功能。
+
+### 2.3 关键设计点
 
 **`EmbeddingConfig.embed_dim` 属性**：
 
@@ -184,7 +222,9 @@ if not os.path.exists(fpath):
 
 若帧图像文件已存在则跳过保存，这在预处理被中断后重新运行时能自动跳过已完成的帧，无需重复计算。
 
-### 4.2 `segment_video`：两级时间分段
+### 4.2 `segment_video` / `segment_video_smart`：两级时间分段
+
+**固定步长版本 `segment_video`**（默认）：
 
 ```python
 l1_starts = np.arange(0.0, video_duration, l1_duration)[:l1_max]
@@ -194,17 +234,117 @@ for l1_s in l1_starts:
     ...
 ```
 
-使用 `np.arange` 生成等间隔时间点，然后截断到最大节点数，确保最后一个段/片段的结束时间不超过视频总时长（通过 `min` 保证）。
+使用 `np.arange` 生成等间隔时间点，截断到最大节点数，末尾段/片段通过 `min` 保证不超过视频时长。
 
-### 4.3 `VLMDescriptionGenerator`：VLM 描述生成
+**语义感知版本 `segment_video_smart`**（Qwen 增强）：
 
-支持三种后端的统一接口：
+```python
+def segment_video_smart(video_duration, boundary_timestamps,
+                         l1_min_duration, l1_max_duration, ...):
+    # 1. 候选边界 = 场景检测点 + 首尾
+    # 2. 贪心合并（过短段：< l1_min_duration 合并到前段）
+    # 3. 均匀拆分（过长段：> l1_max_duration 均匀拆为 n 段）
+    # 4. 截断到 l1_max
+    # 5. 每段内固定步长生成 L2
+```
+
+与 `segment_video` 的本质区别：L1 边界由 Qwen-VL 检测的场景转换点决定，而非固定步长。这保证了每个 L1 段内的内容语义连贯（不会"切断"一场正在进行的戏剧场景），使 L1 摘要更准确，Phase 1 路由命中率更高。
+
+### 4.3 `QwenSceneDetector`：Qwen-VL 智能场景检测
+
+**核心问题**：固定时长切分可能将同一场景切成两段（如一场对话被 600s 边界截断），或将多个不同场景合并到同一段。`QwenSceneDetector` 通过视觉内容感知解决这一问题。
+
+**工作原理（滑动窗口）**：
+
+```
+全部探测帧（0.5fps）: [F0, F1, F2, F3, F4, F5, F6, F7, ...]
+                        └──────batch_size=4──────┘
+                           Qwen-VL: "哪对相邻帧之间有场景切换？"
+                           → JSON: [1, 3]（即 F1→F2 和 F3→F4 切换）
+                                         步长=3（重叠1帧）
+                                         └──────batch_size=4──────┘
+                                              Qwen-VL: [...]
+```
+
+```python
+class QwenSceneDetector:
+    _PROMPT = (
+        "...Identify which consecutive frame pairs show a SIGNIFICANT scene change..."
+        "Respond ONLY with a valid JSON array of 0-based frame indices after which..."
+    )
+    
+    def detect_boundaries(self, frames_with_timestamps, batch_size=8):
+        # 滑动窗口，步长 = batch_size - 1（首尾重叠1帧保证连续性）
+        while start < n - 1:
+            local_indices = self._call_qwen(batch_imgs)  # → [2, 5] 等
+            for local_idx in local_indices:
+                boundary_timestamps.append(midpoint(ts[idx], ts[idx+1]))
+            start += step
+        return sorted(set(boundary_timestamps))
+```
+
+**关键设计点**：
+1. **结构化输出**：Prompt 要求 Qwen-VL 返回纯 JSON 数组，用 `re.search(r'\[.*?\]', ...)` 鲁棒解析
+2. **重叠帧**：相邻批次共享 1 帧，确保批次边界处的场景切换不被遗漏
+3. **边界取中点**：场景边界时间 = 两帧时间戳的均值，定位更精确
+4. **零温度**：`temperature=0.0` 保证输出确定性，避免随机性引入错误检测
+5. **兜底降级**：调用失败时返回 `[]`，`segment_video_smart` 退化为只用首尾作边界，等价于 `segment_video`
+
+**API 调用次数估算（2h 视频，0.5fps，batch=8）**：
+- 探测帧数 = 3600 帧；批次数 = 3600 / 7 ≈ 515 次调用
+- 与 L1/L2 VLM 描述生成（约 372 次）量级相当
+
+### 4.4 `QwenKeyframeScorer`：Qwen-VL 关键帧打分筛选
+
+**核心问题**：以 1fps 从 20s 的 L2 clip 中提取 20 帧，其中大量帧可能是静止背景、闭眼瞬间或无关过渡帧，这些帧作为 L3 节点会稀释有效信号，增加 Phase 3 检索噪声。
+
+**工作原理**：
+
+```python
+class QwenKeyframeScorer:
+    _PROMPT_TMPL = (
+        "You are analyzing {n} frames...Rate each frame's importance..."
+        "Respond ONLY with a valid JSON array of frame indices (0-based) sorted by importance..."
+        "containing exactly the top {top_k} frame indices..."
+    )
+    
+    def filter_top_k(self, frames_meta, images, top_k):
+        if len(images) <= top_k:
+            return frames_meta, images  # 无需筛选
+        
+        ranked = self._call_qwen(images, top_k)  # → [4, 12, 7, 1, ...]（重要性降序）
+        if not ranked:
+            indices = uniform_downsample(n, top_k)  # 兜底
+        else:
+            indices = sorted(ranked[:top_k])  # 按时序重排，保持时间连续性
+        return frames_meta[indices], images[indices]
+```
+
+**一次调用解决问题**：不同于场景检测需要多次调用，每个 L2 clip 只需**一次 API 调用**，将该 clip 内所有帧送入 Qwen-VL 并获取排序结果。
+
+**`pipeline.py` 中的集成逻辑**：
+
+```python
+if qwen_keyframe_scorer is not None and len(l3_frames_meta) > 1:
+    top_k = max(1, round(len(valid_imgs) * pyr_cfg.qwen_keyframe_keep_ratio))
+    filtered_meta, filtered_imgs = qwen_keyframe_scorer.filter_top_k(
+        valid_meta, valid_imgs_for_score, top_k
+    )
+    # 用筛选后的帧替换，后续 CLIP 编码和投影正常进行
+```
+
+**预期提升**：筛选后 L3 节点全为高信息密度关键帧（动作高峰、视觉变化剧烈处），Phase 3 的检索信噪比显著提升（预期 +10-15% 准确率）。
+
+### 4.5 `VLMDescriptionGenerator`：VLM 描述生成
+
+支持四种后端的统一接口：
 
 | 后端 | 用途 | 实现方式 |
 |------|------|---------|
 | `stub` | 开发调试 | 直接返回占位文本，不发起任何网络请求 |
 | `ollama` | 本地部署 | POST `/api/chat`，图像通过 `base64` 字段传输 |
 | `openai` | 云端高质量 | POST `/v1/chat/completions`，图像通过 `image_url` 传输 |
+| `qwen` | 阿里云百炼 | OpenAI 兼容接口，支持多图，图像先于文本传入 |
 
 **指数退避重试**：
 
@@ -216,9 +356,7 @@ for attempt in range(retries + 1):
         time.sleep(2 ** attempt)  # 1s, 2s, 4s...
 ```
 
-VLM API 调用可能因网络或模型繁忙失败，指数退避避免了立即重试加剧服务器负担，同时给 API 服务恢复时间。
-
-### 4.4 `sample_representative_frames`：均匀代表帧采样
+### 4.6 `sample_representative_frames`：均匀代表帧采样
 
 ```python
 indices = [int(round(i * (n - 1) / (max_frames - 1))) for i in range(max_frames)]
@@ -448,7 +586,40 @@ run_from_pyramid(pyramid_dir, query)
 
 模式 2 适合**生产环境**：预处理一次，多次查询共享同一金字塔，检索延迟极低（< 100ms）。
 
-### 8.3 缓存检查逻辑
+### 8.3 Qwen 智能增强分支（v1.1 新增）
+
+`build_pyramid()` 在原有流程基础上新增两条可选分支，由 `PyramidConfig` 中的开关字段控制：
+
+**分支 1：Qwen-VL 场景感知 L1 切分**
+
+```python
+# pipeline.py 中的切分逻辑
+if qwen_scene_detector is not None:
+    # Step 1: 全局探测帧采样（0.5fps）
+    probe_meta = frame_extractor.extract(video, fps=probe_fps, ...)
+    # Step 2: Qwen-VL 批量场景检测
+    boundaries = qwen_scene_detector.detect_boundaries(probe_images_ts)
+    # Step 3: 基于边界的语义感知切分
+    segments_info = segment_video_smart(duration, boundaries, ...)
+else:
+    segments_info = segment_video(duration, ...)  # 原始固定步长
+```
+
+**分支 2：Qwen-VL L3 关键帧筛选**
+
+```python
+# 在 L3 帧提取后、CLIP 编码前插入
+if qwen_keyframe_scorer is not None and len(l3_frames_meta) > 1:
+    top_k = max(1, round(n * pyr_cfg.qwen_keyframe_keep_ratio))
+    filtered_meta, filtered_imgs = qwen_keyframe_scorer.filter_top_k(
+        valid_meta, valid_imgs, top_k
+    )
+    # filtered_imgs 直接送入 CLIPFeatureExtractor
+```
+
+两个 `QwenSceneDetector` / `QwenKeyframeScorer` 实例均在 `qwen_api_key` 为空时设为 `None`，此时流程自动退化为原始逻辑，**不影响现有功能**。
+
+### 8.4 缓存检查逻辑
 
 ```python
 if not force_rebuild and HierarchicalSemanticPyramid.exists(save_dir):
@@ -588,5 +759,5 @@ L3 层保留视觉嵌入（而不是对每帧用 VLM 生成描述再文本嵌入
 
 ---
 
-*文档版本：v1.0.0 | 最后更新：2026-02-25*
+*文档版本：v1.1.0 | 最后更新：2026-03-04 | 新增：QwenSceneDetector、QwenKeyframeScorer、segment_video_smart、PyramidConfig Qwen 字段*
 

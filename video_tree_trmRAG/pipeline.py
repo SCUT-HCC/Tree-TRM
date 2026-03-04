@@ -38,11 +38,14 @@ from .config import VideoTreeTRMConfig
 from .video_indexer import (
     CLIPFeatureExtractor,
     OllamaTextEmbedder,
+    QwenKeyframeScorer,
+    QwenSceneDetector,
     VideoFrameExtractor,
     VLMDescriptionGenerator,
     get_video_duration,
     sample_representative_frames,
     segment_video,
+    segment_video_smart,
 )
 from .video_pyramid import ClipNode, FrameNode, HierarchicalSemanticPyramid, SegmentNode
 from .video_tree_trm import RetrievalTrace, VideoTreeTRM
@@ -328,6 +331,43 @@ class VideoQAPipeline:
                 )
                 return emb.encode([text])
 
+        # ── Qwen 智能组件初始化（可选） ────────────────────────────────
+        _qwen_api_key = self.config.vlm.qwen_api_key
+        _qwen_api_url = self.config.vlm.qwen_api_url
+        _qwen_vlm_model = self.config.vlm.qwen_vlm_model
+
+        qwen_scene_detector: Optional[QwenSceneDetector] = None
+        if pyr_cfg.use_qwen_scene_detection:
+            if not _qwen_api_key:
+                logger.warning(
+                    "use_qwen_scene_detection=True 但 qwen_api_key 为空，"
+                    "已自动回退到固定时长切分。"
+                )
+            else:
+                qwen_scene_detector = QwenSceneDetector(
+                    qwen_api_key=_qwen_api_key,
+                    qwen_api_url=_qwen_api_url,
+                    qwen_model=_qwen_vlm_model,
+                    timeout=self.config.vlm.timeout,
+                )
+                logger.info("✅ Qwen-VL 场景检测器已启用（智能 L1 切分）。")
+
+        qwen_keyframe_scorer: Optional[QwenKeyframeScorer] = None
+        if pyr_cfg.use_qwen_keyframe_scoring:
+            if not _qwen_api_key:
+                logger.warning(
+                    "use_qwen_keyframe_scoring=True 但 qwen_api_key 为空，"
+                    "已自动回退到均匀采样。"
+                )
+            else:
+                qwen_keyframe_scorer = QwenKeyframeScorer(
+                    qwen_api_key=_qwen_api_key,
+                    qwen_api_url=_qwen_api_url,
+                    qwen_model=_qwen_vlm_model,
+                    timeout=self.config.vlm.timeout,
+                )
+                logger.info("✅ Qwen-VL 关键帧打分器已启用（Top-K L3 筛选）。")
+
         # ── 创建金字塔容器 ─────────────────────────────────────────────
         pyramid = HierarchicalSemanticPyramid(
             video_path=video_path,
@@ -340,18 +380,60 @@ class VideoQAPipeline:
             l3_fps=pyr_cfg.l3_fps,
         )
 
-        # ── 时间分段 ───────────────────────────────────────────────────
-        segments_info = segment_video(
-            video_duration=duration,
-            l1_duration=pyr_cfg.l1_segment_duration,
-            l2_duration=pyr_cfg.l2_clip_duration,
-            l1_max=pyr_cfg.l1_max_segments,
-            l2_max_per_seg=pyr_cfg.l2_max_clips_per_segment,
-        )
-        logger.info(
-            f"时间分段：{len(segments_info)} 个 L1 段，"
-            f"每段最多 {pyr_cfg.l2_max_clips_per_segment} 个 L2 片段。"
-        )
+        # ── 时间分段（固定步长 或 Qwen 场景感知） ─────────────────────
+        if qwen_scene_detector is not None:
+            logger.info(
+                f"使用 Qwen-VL 场景检测切分（探测帧率={pyr_cfg.scene_detection_probe_fps}fps）..."
+            )
+            # Step 1：以探测帧率均匀采样全局探测帧
+            probe_meta = frame_extractor.extract(
+                video_path,
+                fps=pyr_cfg.scene_detection_probe_fps,
+                prefix="scene_probe",
+            )
+            probe_images_ts = []
+            for _, ts, fpath in probe_meta:
+                try:
+                    from PIL import Image as _PIL
+                    probe_images_ts.append((_PIL.open(fpath).convert("RGB"), ts))
+                except Exception:
+                    pass
+
+            # Step 2：调用 Qwen-VL 检测场景边界
+            boundary_timestamps = qwen_scene_detector.detect_boundaries(
+                probe_images_ts,
+                batch_size=pyr_cfg.scene_detection_batch_size,
+            )
+            logger.info(
+                f"Qwen-VL 检测到 {len(boundary_timestamps)} 个场景边界：{boundary_timestamps}"
+            )
+
+            # Step 3：基于场景边界生成语义感知分段
+            segments_info = segment_video_smart(
+                video_duration=duration,
+                boundary_timestamps=boundary_timestamps,
+                l1_min_duration=pyr_cfg.l1_min_duration,
+                l1_max_duration=pyr_cfg.l1_max_duration,
+                l2_duration=pyr_cfg.l2_clip_duration,
+                l1_max=pyr_cfg.l1_max_segments,
+                l2_max_per_seg=pyr_cfg.l2_max_clips_per_segment,
+            )
+            logger.info(
+                f"场景感知分段：{len(segments_info)} 个 L1 段（最小={pyr_cfg.l1_min_duration}s，"
+                f"最大={pyr_cfg.l1_max_duration}s）。"
+            )
+        else:
+            segments_info = segment_video(
+                video_duration=duration,
+                l1_duration=pyr_cfg.l1_segment_duration,
+                l2_duration=pyr_cfg.l2_clip_duration,
+                l1_max=pyr_cfg.l1_max_segments,
+                l2_max_per_seg=pyr_cfg.l2_max_clips_per_segment,
+            )
+            logger.info(
+                f"固定时长分段：{len(segments_info)} 个 L1 段，"
+                f"每段最多 {pyr_cfg.l2_max_clips_per_segment} 个 L2 片段。"
+            )
 
         # ── 逐段构建金字塔 ─────────────────────────────────────────────
         for seg_idx, (l1_start, l1_end, clips_info) in enumerate(segments_info):
@@ -427,7 +509,7 @@ class VideoQAPipeline:
                     end_sec=l2_end,
                     prefix=f"l3_{seg_idx:03d}_{clip_idx:04d}",
                 )
-                # 限制帧数
+                # 硬上限：截断到最大帧数
                 l3_frames_meta = l3_frames_meta[: pyr_cfg.l3_max_frames_per_clip]
 
                 if l3_frames_meta:
@@ -441,13 +523,41 @@ class VideoQAPipeline:
                         except Exception:
                             l3_images.append(None)  # type: ignore[arg-type]
 
-                    # CLIP 视觉编码（批量）
-                    valid_images = [img for img in l3_images if img is not None]
-                    valid_indices = [i for i, img in enumerate(l3_images) if img is not None]
+                    # ── Qwen-VL 关键帧打分筛选（可选） ────────────────
+                    if qwen_keyframe_scorer is not None and len(l3_frames_meta) > 1:
+                        # 仅对非 None 的帧打分
+                        valid_meta = [
+                            m for m, img in zip(l3_frames_meta, l3_images)
+                            if img is not None
+                        ]
+                        valid_imgs_for_score = [
+                            img for img in l3_images if img is not None
+                        ]
+                        top_k = max(
+                            1,
+                            round(len(valid_imgs_for_score) * pyr_cfg.qwen_keyframe_keep_ratio),
+                        )
+                        filtered_meta, filtered_imgs = qwen_keyframe_scorer.filter_top_k(
+                            valid_meta, valid_imgs_for_score, top_k
+                        )
+                        logger.debug(
+                            f"    L3[{seg_idx},{clip_idx}] 关键帧筛选："
+                            f"{len(valid_imgs_for_score)} → {len(filtered_imgs)} 帧"
+                        )
+                        # 用筛选后的帧替换原始列表
+                        l3_frames_meta = filtered_meta
+                        l3_images_valid = filtered_imgs
+                        valid_indices = list(range(len(filtered_imgs)))
+                    else:
+                        l3_images_valid = [img for img in l3_images if img is not None]
+                        valid_indices = [
+                            i for i, img in enumerate(l3_images) if img is not None
+                        ]
 
-                    if valid_images:
+                    # CLIP 视觉编码（批量）
+                    if l3_images_valid:
                         raw_visual_embeds = clip_extractor.encode_images(
-                            valid_images, normalize=True
+                            l3_images_valid, normalize=True
                         )
                         # 投影：视觉空间 → 文本空间
                         projected_embeds = proj_manager.project(raw_visual_embeds)
@@ -455,12 +565,13 @@ class VideoQAPipeline:
                         projected_embeds = None
 
                     # 构建 L3 帧节点
-                    proj_idx = 0
                     for frame_local_idx, (_, ts, fpath) in enumerate(l3_frames_meta):
                         vis_emb = None
-                        if frame_local_idx in valid_indices and projected_embeds is not None:
-                            vis_emb = projected_embeds[proj_idx]
-                            proj_idx += 1
+                        if (
+                            projected_embeds is not None
+                            and frame_local_idx < len(projected_embeds)
+                        ):
+                            vis_emb = projected_embeds[frame_local_idx]
 
                         frame_node = FrameNode(
                             frame_idx=frame_local_idx,

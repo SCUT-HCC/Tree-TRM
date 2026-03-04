@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -424,6 +425,326 @@ def get_video_duration(video_path: str) -> float:
         raise RuntimeError(
             f"无法获取视频时长（OpenCV 和 PyAV 均失败）：{video_path}\n原因：{exc}"
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Smart Segmentation（基于 Qwen-VL 场景检测）
+# ---------------------------------------------------------------------------
+
+def segment_video_smart(
+    video_duration: float,
+    boundary_timestamps: List[float],
+    l1_min_duration: float = 60.0,
+    l1_max_duration: float = 1200.0,
+    l2_duration: float = 20.0,
+    l1_max: int = 50,
+    l2_max_per_seg: int = 60,
+) -> List[tuple]:
+    """基于 Qwen-VL 检测到的场景边界，生成语义感知的时间分段。
+
+    与 segment_video() 的差异：
+      - L1 边界由场景转换点决定（而非固定步长），
+        语义连贯性更强，避免"切断正在进行的场景"。
+      - 过短的段（< l1_min_duration）自动合并，
+        过长的段（> l1_max_duration）自动均匀拆分。
+      - L2 仍采用固定步长，保持下游行为一致。
+
+    Args:
+        video_duration:      视频总时长（秒）。
+        boundary_timestamps: Qwen-VL 检测出的场景边界时间戳列表（秒）。
+        l1_min_duration:     L1 段最小时长（秒），避免过于碎片化。
+        l1_max_duration:     L1 段最大时长（秒），避免超大段。
+        l2_duration:         L2 片段固定时长（秒）。
+        l1_max:              最大 L1 段数量。
+        l2_max_per_seg:      每个 L1 段内最大 L2 数量。
+
+    Returns:
+        与 segment_video() 格式相同的嵌套列表::
+
+            [(l1_start, l1_end, [(l2_start, l2_end), ...]), ...]
+    """
+    # 构建候选 L1 边界（加入视频起止）
+    raw = sorted(set([0.0] + list(boundary_timestamps) + [video_duration]))
+
+    # 合并过短的段（贪心前向合并）
+    merged_bounds = [0.0]
+    for b in raw[1:]:
+        if b - merged_bounds[-1] >= l1_min_duration:
+            merged_bounds.append(b)
+    if merged_bounds[-1] < video_duration:
+        merged_bounds.append(video_duration)
+
+    # 拆分过长的段
+    l1_intervals: List[tuple] = []
+    for i in range(len(merged_bounds) - 1):
+        s, e = merged_bounds[i], merged_bounds[i + 1]
+        dur = e - s
+        if dur > l1_max_duration:
+            n_splits = math.ceil(dur / l1_max_duration)
+            sub_dur = dur / n_splits
+            for k in range(n_splits):
+                l1_intervals.append((s + k * sub_dur, s + (k + 1) * sub_dur))
+        else:
+            l1_intervals.append((s, e))
+
+    # 截断到 l1_max
+    l1_intervals = l1_intervals[:l1_max]
+
+    # 为每个 L1 段构建 L2 子片段列表
+    segments = []
+    for l1_s, l1_e in l1_intervals:
+        clips: List[tuple] = []
+        l2_starts = np.arange(l1_s, l1_e, l2_duration)
+        l2_starts = l2_starts[:l2_max_per_seg]
+        for l2_s in l2_starts:
+            l2_e = min(float(l2_s) + l2_duration, l1_e)
+            clips.append((float(l2_s), float(l2_e)))
+        segments.append((float(l1_s), float(l1_e), clips))
+
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Qwen-VL Scene Detector
+# ---------------------------------------------------------------------------
+
+class QwenSceneDetector:
+    """使用 Qwen-VL API 检测视频帧序列中的场景边界。
+
+    通过将连续帧序列批量发送给 Qwen-VL，请求其识别相邻帧之间的场景转换点，
+    替代固定时长切分策略，使 L1/L2 分段更符合视频内容的语义边界。
+
+    工作流程：
+      1. 以 scene_detection_probe_fps 采样探测帧（低帧率，降低 API 调用次数）。
+      2. 以 batch_size 为窗口、batch_size-1 为步长滑动批次，发送给 Qwen-VL。
+      3. Qwen-VL 以 JSON 数组形式返回批次内发生场景切换的帧索引。
+      4. 将批次内局部索引映射回全局时间戳，汇总为场景边界列表。
+
+    Args:
+        qwen_api_key: 阿里云百炼 API Key。
+        qwen_api_url: 百炼 OpenAI 兼容接口地址。
+        qwen_model:   千问视觉模型名称（如 "qwen-vl-plus"）。
+        timeout:      API 请求超时（秒）。
+    """
+
+    _PROMPT = (
+        "You are analyzing a sequence of video frames captured at regular intervals. "
+        "The frames are in chronological order: Frame 0, Frame 1, ..., Frame N-1. "
+        "Identify which consecutive frame pairs show a SIGNIFICANT scene change "
+        "(e.g., new location, major time skip, completely different environment or activity). "
+        "Respond ONLY with a valid JSON array of 0-based frame indices after which a major "
+        "scene change occurs. Example: if scene changes after Frame 2 and Frame 7, reply: [2, 7] "
+        "If no significant scene change is detected, reply: [] "
+        "IMPORTANT: Output ONLY the JSON array — no explanation, no extra text."
+    )
+
+    def __init__(
+        self,
+        qwen_api_key: str,
+        qwen_api_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        qwen_model: str = "qwen-vl-plus",
+        timeout: int = 90,
+    ) -> None:
+        self.qwen_api_key = qwen_api_key
+        self.qwen_api_url = qwen_api_url
+        self.qwen_model = qwen_model
+        self.timeout = timeout
+
+    def detect_boundaries(
+        self,
+        frames_with_timestamps: List[tuple],
+        batch_size: int = 8,
+    ) -> List[float]:
+        """检测场景边界，返回边界时间戳列表。
+
+        Args:
+            frames_with_timestamps: (PIL.Image, timestamp_sec) 元组列表，
+                                    按时间升序排列。
+            batch_size:             每批发送给 Qwen-VL 的帧数（含1帧首尾重叠）。
+
+        Returns:
+            场景边界时间戳列表（秒），表示在该时间点之后发生了场景切换。
+            空列表表示未检测到场景切换。
+        """
+        if len(frames_with_timestamps) < 2:
+            return []
+
+        images = [f[0] for f in frames_with_timestamps]
+        timestamps = [f[1] for f in frames_with_timestamps]
+        n = len(images)
+
+        boundary_timestamps: List[float] = []
+        step = max(1, batch_size - 1)  # 相邻批次重叠 1 帧，保证连续性
+        start = 0
+
+        while start < n - 1:
+            end = min(start + batch_size, n)
+            batch_imgs = images[start:end]
+            batch_ts = timestamps[start:end]
+
+            local_indices = self._call_qwen(batch_imgs)
+            for local_idx in local_indices:
+                global_idx = start + local_idx
+                if 0 <= global_idx < n - 1:
+                    # 取两帧时间戳的中点作为边界
+                    boundary_timestamps.append(
+                        (timestamps[global_idx] + timestamps[global_idx + 1]) / 2.0
+                    )
+
+            start += step
+
+        return sorted(set(boundary_timestamps))
+
+    def _call_qwen(self, frames: List[Image.Image]) -> List[int]:
+        """单次 API 调用：返回当前批次内的场景边界帧索引列表。"""
+        content: list = []
+        for frame in frames:
+            b64 = _pil_to_base64(frame)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+        content.append({"type": "text", "text": self._PROMPT})
+
+        payload = {
+            "model": self.qwen_model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 128,
+            "temperature": 0.0,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.qwen_api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(
+                self.qwen_api_url, json=payload, headers=headers, timeout=self.timeout
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            m = re.search(r"\[.*?\]", text, re.DOTALL)
+            if m:
+                indices = json.loads(m.group())
+                n = len(frames)
+                return [i for i in indices if isinstance(i, int) and 0 <= i < n - 1]
+        except Exception as exc:
+            logger.warning(f"[QwenSceneDetector] API 调用失败：{exc}，跳过此批次。")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Qwen-VL Keyframe Scorer
+# ---------------------------------------------------------------------------
+
+class QwenKeyframeScorer:
+    """使用 Qwen-VL 对 L3 候选帧进行信息密度打分，保留 Top-K 关键帧。
+
+    在固定 fps 均匀采样之后，将一个 L2 clip 内的所有候选帧一次性发给
+    Qwen-VL，由其根据动作重要性与视觉信息密度对帧排序，最终仅保留
+    前 K 帧作为 L3 节点。这样既减少了冗余帧对检索的干扰，又保留了
+    语义最丰富的关键时刻。
+
+    若 Qwen 调用失败，自动兜底为均匀降采样，保证流程不中断。
+
+    Args:
+        qwen_api_key: 阿里云百炼 API Key。
+        qwen_api_url: 百炼 OpenAI 兼容接口地址。
+        qwen_model:   千问视觉模型名称（如 "qwen-vl-plus"）。
+        timeout:      API 请求超时（秒）。
+    """
+
+    _PROMPT_TMPL = (
+        "You are analyzing {n} frames extracted from a short video clip. "
+        "Rank each frame by its importance for capturing key actions, "
+        "significant visual details, notable objects, or informative content. "
+        "Respond ONLY with a valid JSON array of frame indices (0-based) sorted by importance "
+        "(most important first), containing exactly the top {top_k} frame indices. "
+        "Example (top 3 out of 10 frames): [4, 1, 7] "
+        "IMPORTANT: Output ONLY the JSON array — no explanation, no extra text."
+    )
+
+    def __init__(
+        self,
+        qwen_api_key: str,
+        qwen_api_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        qwen_model: str = "qwen-vl-plus",
+        timeout: int = 90,
+    ) -> None:
+        self.qwen_api_key = qwen_api_key
+        self.qwen_api_url = qwen_api_url
+        self.qwen_model = qwen_model
+        self.timeout = timeout
+
+    def filter_top_k(
+        self,
+        frames_meta: List[tuple],
+        images: List[Image.Image],
+        top_k: int,
+    ) -> tuple:
+        """对候选帧打分并返回 Top-K 帧（按原始时序排列）。
+
+        Args:
+            frames_meta: 帧元数据列表，每项为 (idx, timestamp, path)。
+            images:      对应 PIL.Image 列表（与 frames_meta 一一对应）。
+            top_k:       最终保留的帧数量。
+
+        Returns:
+            (filtered_frames_meta, filtered_images) 元组，
+            均按原始时序（timestamp 升序）排列。
+        """
+        n = len(images)
+        if n <= top_k:
+            return frames_meta, images
+
+        ranked = self._call_qwen(images, top_k)
+        if not ranked:
+            # 兜底：均匀降采样
+            indices = [int(round(i * (n - 1) / (top_k - 1))) for i in range(top_k)]
+            indices = sorted(set(indices))
+        else:
+            # 取前 top_k 个，按时序重排（保持时间顺序）
+            indices = sorted(set(ranked[:top_k]))
+
+        out_meta = [frames_meta[i] for i in indices if i < n]
+        out_imgs = [images[i] for i in indices if i < n]
+        return out_meta, out_imgs
+
+    def _call_qwen(self, frames: List[Image.Image], top_k: int) -> List[int]:
+        """单次 API 调用：返回 Top-K 帧的索引（按重要性降序）。"""
+        n = len(frames)
+        prompt = self._PROMPT_TMPL.format(n=n, top_k=min(top_k, n))
+        content: list = []
+        for frame in frames:
+            b64 = _pil_to_base64(frame)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+        content.append({"type": "text", "text": prompt})
+
+        payload = {
+            "model": self.qwen_model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 128,
+            "temperature": 0.0,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.qwen_api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(
+                self.qwen_api_url, json=payload, headers=headers, timeout=self.timeout
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            m = re.search(r"\[.*?\]", text, re.DOTALL)
+            if m:
+                indices = json.loads(m.group())
+                return [i for i in indices if isinstance(i, int) and 0 <= i < n]
+        except Exception as exc:
+            logger.warning(f"[QwenKeyframeScorer] API 调用失败：{exc}，使用均匀采样兜底。")
+        return []
 
 
 # ---------------------------------------------------------------------------
